@@ -1,0 +1,191 @@
+WINDOWS TALK TOPICS TO COVER:
+
+OVERVIEW
+- 1. Why do we care? Windows most prolific OS, used basically everywhere,
+	shitloads of vulns etc.
+- How is Windows "organised"/different to Linux?
+- Important user accounts and user groups
+- How to tell if you are looking at a DC
+- Attacks
+- Kerberoasting example (Attacktive/Follow along practical)
+
+Windows is a huge topic, so if you have any questions, I'll take them at the end
+
+
+- Most Windows machines will be in DOMAINS, running Active Directory Domain Services
+- But before I get ahead of myself...
+-	DOMAINS vs. WORKGROUPS
+Workgroups = "Local" - no central control, have to manually replicate configs/settings
+	changes across all connected PCs. Not ideal, although you can set up network shares
+	etc. to work with Workgroups in a /small/ area, e.g. NAS/home office
+
+Domains = More organised. Centrally controlled, allow admins to make settings changes/config
+	changes REMOTELY via Group Policy
+	- First requirement is a server running AD DS (Active Directory Domain Services).
+		This server is referred to as a "Domain Controller"
+
+		Can also run other things such as a print server, user file shares, etc.
+		LOL: https://msrc.microsoft.com/update-guide/vulnerability/CVE-2021-34527
+		Vulnerability in the print spooler service that allows execution of code
+		as SYSTEM (Windows version of root on a local computer)
+
+		SYSTEM has Full Control permissions on all files of connected NTFS
+		volumes
+
+	- You can have multiple domains within each other (like normal subdomains), which
+	  can be used to segment a network more (also provides better/more granular
+	  security). This is called a Forest
+
+	Forest name: contoso.com      		<--- Root Domain
+	Domain name: sales.contoso.com
+	Domain Controller name: dc1.sales.contoso.com
+
+	*Can have DCs at different levels of the domain, e.g. dc1.contoso.com
+
+	First domain to be created in the forest is the root domain
+
+	- User/Computer Accounts
+		Allow settings/goup memberships/permissions to have different effects on
+		objects, depending on if they are user/Computer accounts
+
+		EXAMPLE: Web proxy access dictated by Computer acct
+			 Network share (e.g. Finance/HR) access dictated by User acct
+
+
+Key user accounts to know:
+	Administrator   <--- Administrator on a Domain Controller. Compromising this account
+				allows you to do anything on the domain. "King of the castle"
+
+	krbtgt 		<--- This account's NT hash is used to encrypt Kerberos tickets
+				that domain users use to authenticate with the domain
+				controller
+
+
+User Groups:
+- This is how AD permissions are managed and applied (e.g. granting Sales access to the 
+  sales network share), there are a few built-in groups of interest to us.
+
+	- Domain Admins	<--- Self-explanatory
+	
+	- Enterprise Admins <--- This group only exists on the root domain controller
+				 , and provides admin access to member accounts to
+				 every domain in the forest
+
+	- DNS Admins	<--- Can use their permissions to run dnscmd.exe to load custom
+			     dlls and escalate privilege
+
+	- Print Operators <--- Can log into domain controllers
+
+	- Remote Desktop users <--- Can log into domain controllers over RDP
+
+	- And many more...
+
+
+So how do I know if I'm even looking at a DC, anyway?
+- DCs commonly have the following ports open:
+
+	53 (DNS) - As domain controllers also act as DNS servers
+	88 (Kerberos) - Used to authenticate users logging in
+	135/139 - RPC and netbios
+	445 - SMB, useful to enumerate with smbclient, early versions vulnerable to eternalblue
+	3268 - LDAP
+	3389 - RDP - useful to log into, can also glean information from the certificate such as
+		     domain/computer name and OS version
+
+	DCs MIGHT also be running Microsoft IIS as an HTTP server, although this isn't common
+	as it's really bad practice - DCs should be internal machines only
+
+How do I attack/poke a Windows box? (Demo of Attacktive Directory - same for practical)
+- Most likely, by compromising one of the admin accounts, then using that to get yourself
+	more access - same as with a Linux box
+- OR, some hilarious new vulnerability that will be around when you're attacking one
+	e.g. ZeroLogon, EternalBlue, etc.
+	Critical vulnerabilities that get you lots of access with little effort
+
+Enumeration:
+- Nmap first: 
+	nmap -sCV -oA nmap/attacktive <IP>
+		This tells you info about the domain. Port 80 open, slightly unusual
+			Web enumeration stuff from here, gobuster etc...
+
+		Port 3389, attacktivedirectory.spookysec.local
+			".local" is a giveaway too, lots of domains end with .local because
+			it's a domain name that doesn't resolve to anything
+
+		Kerberos is running on Port 88, so we can test for active user accounts
+		to break
+
+SECOND: Install Impacket, as this will be useful later on
+	
+	sudo apt install golang
+	export GOROOT=/usr/lib/go
+	export GOPATH=$HOME/go
+	export PATH=$GOPATH/bin:$GOROOT/bin:$PATH
+	
+	sudo git clone https://github.com/SecureAuthCorp/impacket.git /opt/impacket
+	pip3 install -r /opt/impacket/requirements.txt
+	python3 ./setup.py install
+
+KERBRUTE:
+Tool to bruteforce Windows domain account names. Clone to your local machine with this command:
+	
+	sudo git clone https://github.com/ropnop/kerbrute /opt/kerbrute
+	
+	cd /opt/kerbrute
+	sudo make all
+
+	<Kerbrute should then install. Run it from /opt/kerbrute/dist/kerbrute_linux_amd64>
+
+Command to run (from /opt/kerbrute):
+
+./dist/kerbrute_linux_amd_64 userenum -d spookysec.local --dc attacktivedirectory.spookysec.local
+
+
+Using the wordlist provided in the room, we find a load of accounts that exist, and actually
+	get a hash from an account that doesn't require pre-authentication
+
+Interesting accounts from this are: svc-admin (admin!) and backup (backup accts can have
+	lots of privilege with little security - "key under doormat"), therefore they are
+	interesting!
+
+Since we already have the hash of one of these accounts, we can try and crack it with hashcat...
+	Searching the first part of the hash on the hashcat examples, and it is not found ($krb5asrep$18)
+
+	So we need a different hash type, one that hashcat can actually crack.
+
+Running Kerbrute again with the --downgrade switch to ask the DC to provide us with a weaker hash
+	(this option is kept in for compatibility). There is a Group Policy setting to control this
+
+Type 23 hash returned, which is actually supported by hashcat. Cracking the hash of svc-admin with
+	the below command:
+
+	hashcat -m 18200 userlist.txt hashes.txt --force
+
+This gives us svc_admin's password of: management2005
+
+Now we can use smbclient to see what shares this account has access to.
+
+	smbclient -U svc-admin -L //IP/
+	<prompt for pw>
+
+Seeing there is a "backup" share listed, this looks interesting. Connecting to it w/
+
+	smbclient -U svc-admin //IP/backup
+
+Text file with backup creds. Downloading with get
+
+Cat the file, see the data inside is encoded. Likely base64 (because it always is)
+
+Decode the data, we get user creds for another account, backup@spookysec.local, and password backup2517860
+
+Running the impacket tool secretsdump.py backup:backup2517860@spookysec.local
+
+-- This will then drop hashes of all the accounts backup is linked to, which includes Administrator
+
+Fortunate thing is, we can use the hashes themselves to login, saving us the step of cracking them.
+
+sudo gem install evil-winrm
+
+evil-winrm -i IP -u Administrator -H <LM hash>
+
+
